@@ -1,0 +1,697 @@
+diff --git a/src/main/CMakeLists.txt b/src/main/CMakeLists.txt
+index 13ac4a929..5c19528f1 100755
+--- a/src/main/CMakeLists.txt
++++ b/src/main/CMakeLists.txt
+@@ -88,6 +88,8 @@ main_sources(COMMON_SRC
+     drivers/accgyro/accgyro_mpu.h
+     drivers/accgyro/accgyro_mpu6000.c
+     drivers/accgyro/accgyro_mpu6000.h
++    drivers/accgyro/accgyro_mpu6050.c
++    drivers/accgyro/accgyro_mpu6050.h
+     drivers/accgyro/accgyro_mpu6500.c
+     drivers/accgyro/accgyro_mpu6500.h
+     drivers/accgyro/accgyro_mpu9250.c
+diff --git a/src/main/drivers/accgyro/accgyro_mpu.h b/src/main/drivers/accgyro/accgyro_mpu.h
+index 62c2778b4..3638fd659 100644
+--- a/src/main/drivers/accgyro/accgyro_mpu.h
++++ b/src/main/drivers/accgyro/accgyro_mpu.h
+@@ -20,6 +20,13 @@
+ #include "drivers/sensor.h"
+ #include "drivers/accgyro/accgyro.h"
+ 
++#define MPU_I2C_ADDRESS                 0x68
++
++// MPU6050
++#define MPU_RA_WHO_AM_I_LEGACY          0x00
++
++#define MPUx0x0_WHO_AM_I_CONST              (0x68) // MPU6000 and 6050
++
+ #define MPU6000_WHO_AM_I_CONST              (0x68)
+ #define MPU6500_WHO_AM_I_CONST              (0x70)
+ #define MPU9250_WHO_AM_I_CONST              (0x71)
+diff --git a/src/main/drivers/accgyro/accgyro_mpu6050.c b/src/main/drivers/accgyro/accgyro_mpu6050.c
+new file mode 100644
+index 000000000..9899dac8b
+--- /dev/null
++++ b/src/main/drivers/accgyro/accgyro_mpu6050.c
+@@ -0,0 +1,222 @@
++/*
++ * This file is part of INAV.
++ *
++ * INAV is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * INAV is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with INAV.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Authors:
++ * Dominic Clifton - Cleanflight implementation
++ * John Ihlein - Initial FF32 code
++ * Konstantin Sharlaimov - busDevice refactoring
++*/
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "platform.h"
++#include "build/debug.h"
++
++#include "common/axis.h"
++#include "common/maths.h"
++
++#include "drivers/system.h"
++#include "drivers/time.h"
++#include "drivers/io.h"
++#include "drivers/exti.h"
++#include "drivers/bus.h"
++
++#include "drivers/sensor.h"
++#include "drivers/accgyro/accgyro.h"
++#include "drivers/accgyro/accgyro_mpu.h"
++#include "drivers/accgyro/accgyro_mpu6050.h"
++
++#if defined(USE_IMU_MPU6050)
++
++#define BIT_H_RESET                 0x80
++#define MPU_CLK_SEL_PLLGYROZ        0x03
++#define MPU_INQUIRY_MASK            0x7E
++
++typedef enum {
++    MPU6050_NONE                = 0,
++    MPU6050_HALF_RESOLUTION     = 1,
++    MPU6050_FULL_RESOLUTION     = 2
++} mpuDetectionResult_e;
++
++static bool mpu6050InitDone = false;
++
++static void mpu6050AccAndGyroInit(gyroDev_t *gyro)
++{
++    const gyroFilterAndRateConfig_t * config = mpuChooseGyroConfig(gyro->lpf, 1000000 / gyro->requestedSampleIntervalUs);
++    gyro->sampleRateIntervalUs = 1000000 / config->gyroRateHz;
++
++    //gyroIntExtiInit(gyro);
++
++    busSetSpeed(gyro->busDev, BUS_SPEED_INITIALIZATION);
++
++    if (!mpu6050InitDone) {
++        // Device Reset
++        busWrite(gyro->busDev, MPU_RA_PWR_MGMT_1, BIT_H_RESET);
++        delay(150);
++
++        // Clock Source PPL with Z axis gyro reference
++        busWrite(gyro->busDev, MPU_RA_PWR_MGMT_1, MPU_CLK_SEL_PLLGYROZ);
++        delayMicroseconds(15);
++
++        // Accel Sample Rate 1kHz
++        // Gyroscope Output Rate =  1kHz when the DLPF is enabled
++        busWrite(gyro->busDev, MPU_RA_SMPLRT_DIV, config->gyroConfigValues[1]);
++        delayMicroseconds(15);
++
++        // Accel and Gyro DLPF Setting
++        busWrite(gyro->busDev, MPU_RA_CONFIG, config->gyroConfigValues[0]);
++        delayMicroseconds(1);
++
++        // Gyro +/- 2000 DPS Full Scale
++        busWrite(gyro->busDev, MPU_RA_GYRO_CONFIG, INV_FSR_2000DPS << 3);
++        delayMicroseconds(15);
++
++        // Accel +/- 16 G Full Scale
++        busWrite(gyro->busDev, MPU_RA_ACCEL_CONFIG, INV_FSR_16G << 3);
++        delayMicroseconds(15);
++
++        busWrite(gyro->busDev, MPU_RA_INT_PIN_CFG, 0 << 7 | 0 << 6 | 0 << 5 | 0 << 4 | 0 << 3 | 0 << 2 | 1 << 1 | 0 << 0); // INT_PIN_CFG   -- INT_LEVEL_HIGH, INT_OPEN_DIS, LATCH_INT_DIS, INT_RD_CLEAR_DIS, FSYNC_INT_LEVEL_HIGH, FSYNC_INT_DIS, I2C_BYPASS_EN, CLOCK_DIS
++        delayMicroseconds(15);
++
++#ifdef USE_MPU_DATA_READY_SIGNAL
++        busWrite(gyro->busDev, MPU_RA_INT_ENABLE, MPU_RF_DATA_RDY_EN);
++        delayMicroseconds(15);
++#endif
++
++        mpu6050InitDone = true;
++    }
++
++    busSetSpeed(gyro->busDev, BUS_SPEED_FAST);
++}
++
++static void mpu6050AccInit(accDev_t *acc)
++{
++    mpuContextData_t * ctx = busDeviceGetScratchpadMemory(acc->busDev);
++    if (ctx->chipMagicNumber == 0x6850) {
++        acc->acc_1G = 512 * 4;
++    }
++    else {
++        acc->acc_1G = 256 * 4;
++    }
++}
++
++bool mpu6050AccDetect(accDev_t *acc)
++{
++    acc->busDev = busDeviceOpen(BUSTYPE_ANY, DEVHW_MPU6050, acc->imuSensorToUse);
++    if (acc->busDev == NULL) {
++        return false;
++    }
++
++    mpuContextData_t * ctx = busDeviceGetScratchpadMemory(acc->busDev);
++    if (ctx->chipMagicNumber == 0x6850 || ctx->chipMagicNumber == 0x6050) {
++        acc->initFn = mpu6050AccInit;
++        acc->readFn = mpuAccReadScratchpad;
++        acc->accAlign = acc->busDev->param;
++        return true;
++    }
++
++    return false;
++}
++
++static mpuDetectionResult_e mpu6050DeviceDetect(busDevice_t * dev)
++{
++    uint8_t in;
++    uint8_t readBuffer[6];
++    uint8_t attemptsRemaining = 5;
++
++    busSetSpeed(dev, BUS_SPEED_INITIALIZATION);
++
++    busWrite(dev, MPU_RA_PWR_MGMT_1, BIT_H_RESET);
++
++    do {
++        delay(150);
++
++        busRead(dev, MPU_RA_WHO_AM_I, &in);
++        in &= MPU_INQUIRY_MASK;
++        if (in == MPUx0x0_WHO_AM_I_CONST) {
++            break;
++        }
++        if (!attemptsRemaining) {
++            return MPU6050_NONE;
++        }
++    } while (attemptsRemaining--);
++
++    // There is a map of revision contained in the android source tree which is quite comprehensive and may help to understand this code
++    // See https://android.googlesource.com/kernel/msm.git/+/eaf36994a3992b8f918c18e4f7411e8b2320a35f/drivers/misc/mpu6050/mldl_cfg.c
++    // determine product ID and accel revision
++    busReadBuf(dev, MPU_RA_XA_OFFS_H, readBuffer, 6);
++    uint8_t revision = ((readBuffer[5] & 0x01) << 2) | ((readBuffer[3] & 0x01) << 1) | (readBuffer[1] & 0x01);
++
++    if (revision) {
++        /* Congrats, these parts are better. */
++        if (revision == 1) {
++            return MPU6050_HALF_RESOLUTION;
++        } else if (revision == 2) {
++            return MPU6050_FULL_RESOLUTION;
++        } else if ((revision == 3) || (revision == 7)) {
++            return MPU6050_FULL_RESOLUTION;
++        } else {
++            return MPU6050_NONE;
++        }
++    } else {
++        uint8_t productId;
++
++        busRead(dev, MPU_RA_PRODUCT_ID, &productId);
++        revision = productId & 0x0F;
++
++        if (!revision) {
++            return MPU6050_NONE;
++        } else if (revision == 4) {
++            return MPU6050_HALF_RESOLUTION;
++        } else {
++            return MPU6050_FULL_RESOLUTION;
++        }
++    }
++
++    return MPU6050_NONE;
++}
++
++bool mpu6050GyroDetect(gyroDev_t *gyro)
++{
++    gyro->busDev = busDeviceInit(BUSTYPE_ANY, DEVHW_MPU6050, gyro->imuSensorToUse, OWNER_MPU);
++    if (gyro->busDev == NULL) {
++        return false;
++    }
++
++    mpuDetectionResult_e res = mpu6050DeviceDetect(gyro->busDev);
++    if (res == MPU6050_NONE) {
++        busDeviceDeInit(gyro->busDev);
++        return false;
++    }
++
++    // Magic number for ACC detection to indicate that we have detected MPU6000 gyro
++    mpuContextData_t * ctx = busDeviceGetScratchpadMemory(gyro->busDev);
++    ctx->chipMagicNumber = res == MPU6050_FULL_RESOLUTION ? 0x6850 : 0x6050;
++
++    gyro->initFn = mpu6050AccAndGyroInit;
++    gyro->readFn = mpuGyroReadScratchpad;
++    gyro->intStatusFn = gyroCheckDataReady;
++    gyro->temperatureFn = mpuTemperatureReadScratchpad;
++    gyro->scale = 1.0f / 16.4f;     // 16.4 dps/lsb scalefactor
++    gyro->gyroAlign = gyro->busDev->param;
++
++    return true;
++}
++
++#endif
+diff --git a/src/main/drivers/accgyro/accgyro_mpu6050.h b/src/main/drivers/accgyro/accgyro_mpu6050.h
+new file mode 100644
+index 000000000..eab20f3bf
+--- /dev/null
++++ b/src/main/drivers/accgyro/accgyro_mpu6050.h
+@@ -0,0 +1,23 @@
++/*
++ * This file is part of INAV.
++ *
++ * INAV is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * INAV is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with INAV.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include "drivers/sensor.h"
++
++bool mpu6050AccDetect(accDev_t *acc);
++bool mpu6050GyroDetect(gyroDev_t *gyro);
+diff --git a/src/main/drivers/bus.h b/src/main/drivers/bus.h
+index eca213b72..26b6b2f75 100644
+--- a/src/main/drivers/bus.h
++++ b/src/main/drivers/bus.h
+@@ -77,6 +77,7 @@ typedef enum {
+ 
+     /* Combined ACC/GYRO chips */
+     DEVHW_MPU6000,
++    DEVHW_MPU6050,
+     DEVHW_MPU6500,
+     DEVHW_BMI160,
+     DEVHW_BMI088_GYRO,
+diff --git a/src/main/fc/cli.c b/src/main/fc/cli.c
+index 6e904b593..1d5d9ccf6 100644
+--- a/src/main/fc/cli.c
++++ b/src/main/fc/cli.c
+@@ -185,7 +185,7 @@ static const char * const blackboxIncludeFlagNames[] = {
+ 
+ /* Sensor names (used in lookup tables for *_hardware settings and in status command output) */
+ // sync with gyroSensor_e
+-static const char * const gyroNames[] = { "NONE", "AUTO", "MPU6000", "MPU6500", "MPU9250", "BMI160", "ICM20689", "BMI088", "ICM42605", "BMI270","LSM6DXX", "FAKE"};
++static const char * const gyroNames[] = { "NONE", "AUTO", "MPU6050", "MPU6000", "MPU6500", "MPU9250", "BMI160", "ICM20689", "BMI088", "ICM42605", "BMI270","LSM6DXX", "FAKE"};
+ 
+ // sync this with sensors_e
+ static const char * const sensorTypeNames[] = {
+diff --git a/src/main/fc/settings.yaml b/src/main/fc/settings.yaml
+index 805c94b28..8517ffaf4 100644
+--- a/src/main/fc/settings.yaml
++++ b/src/main/fc/settings.yaml
+@@ -4,7 +4,7 @@ tables:
+   - name: gyro_lpf
+     values: ["256HZ", "188HZ", "98HZ", "42HZ", "20HZ", "10HZ"]
+   - name: acc_hardware
+-    values: ["NONE", "AUTO", "MPU6000", "MPU6500", "MPU9250", "BMI160", "ICM20689", "BMI088", "ICM42605", "BMI270","LSM6DXX",  "FAKE"]
++    values: ["NONE", "AUTO", "MPU6050", "MPU6000", "MPU6500", "MPU9250", "BMI160", "ICM20689", "BMI088", "ICM42605", "BMI270","LSM6DXX",  "FAKE"]
+     enum: accelerationSensor_e
+   - name: rangefinder_hardware
+     values: ["NONE", "SRF10", "VL53L0X", "MSP", "BENEWAKE", "VL53L1X", "US42", "TOF10120_I2C", "FAKE"]
+diff --git a/src/main/sensors/acceleration.c b/src/main/sensors/acceleration.c
+index f897d7e58..466d5af54 100644
+--- a/src/main/sensors/acceleration.c
++++ b/src/main/sensors/acceleration.c
+@@ -37,6 +37,7 @@
+ #include "drivers/accgyro/accgyro.h"
+ #include "drivers/accgyro/accgyro_mpu.h"
+ #include "drivers/accgyro/accgyro_mpu6000.h"
++#include "drivers/accgyro/accgyro_mpu6050.h"
+ #include "drivers/accgyro/accgyro_mpu6500.h"
+ #include "drivers/accgyro/accgyro_mpu9250.h"
+ 
+@@ -130,6 +131,18 @@ static bool accDetect(accDev_t *dev, accelerationSensor_e accHardwareToUse)
+     switch (accHardwareToUse) {
+     case ACC_AUTODETECT:
+         FALLTHROUGH;
++#ifdef USE_IMU_MPU6050
++    case ACC_MPU6050: // MPU6050
++        if (mpu6050AccDetect(dev)) {
++            accHardware = ACC_MPU6050;
++            break;
++        }
++        /* If we are asked for a specific sensor - break out, otherwise - fall through and continue */
++        if (accHardwareToUse != ACC_AUTODETECT) {
++            break;
++        }
++        FALLTHROUGH;
++#endif
+ 
+ #ifdef USE_IMU_MPU6000
+     case ACC_MPU6000:
+diff --git a/src/main/sensors/acceleration.h b/src/main/sensors/acceleration.h
+index d81a83a90..437b9e3f6 100644
+--- a/src/main/sensors/acceleration.h
++++ b/src/main/sensors/acceleration.h
+@@ -35,6 +35,7 @@
+ typedef enum {
+     ACC_NONE = 0,
+     ACC_AUTODETECT,
++    ACC_MPU6050,
+     ACC_MPU6000,
+     ACC_MPU6500,
+     ACC_MPU9250,
+diff --git a/src/main/sensors/gyro.c b/src/main/sensors/gyro.c
+index a586ce6df..d36f18a57 100644
+--- a/src/main/sensors/gyro.c
++++ b/src/main/sensors/gyro.c
+@@ -39,6 +39,7 @@
+ #include "drivers/accgyro/accgyro.h"
+ #include "drivers/accgyro/accgyro_mpu.h"
+ #include "drivers/accgyro/accgyro_mpu6000.h"
++#include "drivers/accgyro/accgyro_mpu6050.h"
+ #include "drivers/accgyro/accgyro_mpu6500.h"
+ #include "drivers/accgyro/accgyro_mpu9250.h"
+ 
+@@ -135,6 +136,15 @@ STATIC_UNIT_TESTED gyroSensor_e gyroDetect(gyroDev_t *dev, gyroSensor_e gyroHard
+     case GYRO_AUTODETECT:
+         FALLTHROUGH;
+ 
++#ifdef USE_IMU_MPU6050
++    case GYRO_MPU6050:
++        if (mpu6050GyroDetect(dev)) {
++            gyroHardware = GYRO_MPU6050;
++            break;
++        }
++        FALLTHROUGH;
++#endif
++
+ #ifdef USE_IMU_MPU6000
+     case GYRO_MPU6000:
+         if (mpu6000GyroDetect(dev)) {
+diff --git a/src/main/sensors/gyro.h b/src/main/sensors/gyro.h
+index 669f8fbee..7f453dbd7 100644
+--- a/src/main/sensors/gyro.h
++++ b/src/main/sensors/gyro.h
+@@ -34,6 +34,7 @@
+ typedef enum {
+     GYRO_NONE = 0,
+     GYRO_AUTODETECT,
++    GYRO_MPU6050,
+     GYRO_MPU6000,
+     GYRO_MPU6500,
+     GYRO_MPU9250,
+diff --git a/src/main/target/STM32F411CE/CMakeLists.txt b/src/main/target/STM32F411CE/CMakeLists.txt
+new file mode 100644
+index 000000000..3d2b48a99
+--- /dev/null
++++ b/src/main/target/STM32F411CE/CMakeLists.txt
+@@ -0,0 +1 @@
++target_stm32f411xe(STM32F411CE HSE_MHZ 25)
+diff --git a/src/main/target/STM32F411CE/config.c b/src/main/target/STM32F411CE/config.c
+new file mode 100644
+index 000000000..07f6de469
+--- /dev/null
++++ b/src/main/target/STM32F411CE/config.c
+@@ -0,0 +1,28 @@
++/*
++ * This file is part of Cleanflight.
++ *
++ * Cleanflight is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * Cleanflight is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with Cleanflight.  If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#include <stdint.h>
++#include "platform.h"
++
++#include "fc/fc_msp_box.h"
++
++#include "io/piniobox.h"
++
++void targetConfiguration(void)
++{
++    pinioBoxConfigMutable()->permanentId[0] = BOX_PERMANENT_ID_USER1;
++}
+diff --git a/src/main/target/STM32F411CE/target.c b/src/main/target/STM32F411CE/target.c
+new file mode 100644
+index 000000000..9bfaf96c5
+--- /dev/null
++++ b/src/main/target/STM32F411CE/target.c
+@@ -0,0 +1,42 @@
++/*
++* This file is part of Cleanflight.
++*
++* Cleanflight is free software: you can redistribute it and/or modify
++* it under the terms of the GNU General Public License as published by
++* the Free Software Foundation, either version 3 of the License, or
++* (at your option) any later version.
++*
++* Cleanflight is distributed in the hope that it will be useful,
++* but WITHOUT ANY WARRANTY; without even the implied warranty of
++* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++* GNU General Public License for more details.
++*
++* You should have received a copy of the GNU General Public License
++* along with Cleanflight.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include <stdbool.h>
++#include <platform.h>
++
++#include "drivers/io.h"
++#include "drivers/pwm_mapping.h"
++#include "drivers/timer.h"
++
++
++timerHardware_t timerHardware[] = {
++    DEF_TIM(TIM9, CH2, PA3,   TIM_USE_PPM,   0, 0), // PPM IN
++
++
++    DEF_TIM(TIM3, CH1, PB4,  TIM_USE_OUTPUT_AUTO,  0, 0), // S1  D(1,4,5)
++    DEF_TIM(TIM3, CH2, PB5,  TIM_USE_OUTPUT_AUTO,  0, 0), // S2  D(1,5,5)
++    DEF_TIM(TIM4, CH1, PB6,  TIM_USE_OUTPUT_AUTO,  0, 0), // S3  D(1,0,2)
++    DEF_TIM(TIM4, CH2, PB7,  TIM_USE_OUTPUT_AUTO,  0, 0), // S4  D(1,3,2)
++    DEF_TIM(TIM2, CH1, PA5,  TIM_USE_OUTPUT_AUTO,  0, 0), // S5  D(1,6,3)
++    DEF_TIM(TIM2, CH3, PB10, TIM_USE_OUTPUT_AUTO,  0, 0), // S6  D(1,1,3)
++    DEF_TIM(TIM5, CH1, PA0,  TIM_USE_OUTPUT_AUTO,  0, 0), // S7
++    DEF_TIM(TIM5, CH2, PA1,  TIM_USE_OUTPUT_AUTO,  0, 0), // S8
++    
++    DEF_TIM(TIM1, CH1, PA8,  TIM_USE_ANY,   0, 0), // 2812LED TIM_USE_LED   D(2,1,6)
++
++};
++const int timerHardwareCount = sizeof(timerHardware) / sizeof(timerHardware[0]);
+diff --git a/src/main/target/STM32F411CE/target.h b/src/main/target/STM32F411CE/target.h
+new file mode 100644
+index 000000000..6101f0cfa
+--- /dev/null
++++ b/src/main/target/STM32F411CE/target.h
+@@ -0,0 +1,153 @@
++#pragma once
++
++#define TARGET_BOARD_IDENTIFIER "ST41"
++
++#define USBD_PRODUCT_STRING  "STM32F411CE"
++
++#define LED0                    PC13
++//#define LED1                    PC14
++
++//#define BEEPER                  PB2
++//#define BEEPER_INVERTED
++
++// *************** SPI1 Gyro & ACC **********************
++
++// #define USE_SPI
++// #define USE_SPI_DEVICE_1
++
++// #define SPI1_SCK_PIN            PA5
++// #define SPI1_MISO_PIN           PA6
++// #define SPI1_MOSI_PIN           PA7
++
++
++#define USE_SPI
++#define USE_SPI_DEVICE_2
++
++#define SPI2_SCK_PIN            PB13
++#define SPI2_MISO_PIN           PB14
++#define SPI2_MOSI_PIN           PB15
++
++#define USE_IMU_MPU9250
++#define IMU_MPU9250_ALIGN       CW0_DEG
++#define MPU9250_CS_PIN          PB12
++#define MPU9250_SPI_BUS         BUS_SPI2
++
++#define USE_IMU_MPU6000
++#define MPU6000_SPI_BUS         BUS_SPI2
++#define MPU6000_CS_PIN          PB12
++#define IMU_MPU6000_ALIGN       CW0_DEG
++
++#define USE_IMU_MPU6500
++#define MPU6500_SPI_BUS         BUS_SPI2
++#define MPU6500_CS_PIN          PB12
++#define IMU_MPU6500_ALIGN       CW0_DEG
++
++
++// *************** SPI2 OSD *****************************
++
++#define USE_MAX7456
++#define MAX7456_SPI_BUS         BUS_SPI2
++#define MAX7456_CS_PIN          PC14
++
++// *************** SPI FLASH **************************
++
++#define USE_FLASHFS
++#define USE_FLASH_M25P16
++#define M25P16_CS_PIN           PA4
++#define M25P16_SPI_BUS          BUS_SPI2
++#define ENABLE_BLACKBOX_LOGGING_ON_SPIFLASH_BY_DEFAULT
++
++// *************** UART *****************************
++
++#define USE_VCP
++#define VBUS_SENSING_PIN        PC15
++#define VBUS_SENSING_ENABLED
++
++#define USE_UART1
++#define UART1_TX_PIN            PA15
++#define UART1_RX_PIN            PB3
++
++#define USE_UART2
++#define UART2_TX_PIN            PA2
++#define UART2_RX_PIN            PA3
++
++//#define USE_SOFTSERIAL1
++//#define SOFTSERIAL_1_TX_PIN     PA0 // ST1 pad
++//#define SOFTSERIAL_1_RX_PIN     PA8 // LED pad
++
++#define SERIAL_PORT_COUNT       3
++
++//#define USE_RX_PPM
++#define DEFAULT_RX_TYPE         RX_TYPE_SERIAL
++#define SERIALRX_PROVIDER       SERIALRX_SBUS
++#define SERIALRX_UART           SERIAL_PORT_USART2
++
++// *************** I2C /Baro/Mag/Pitot ********************
++#define USE_I2C
++#define USE_I2C_DEVICE_1
++#define I2C1_SCL                PB8
++#define I2C1_SDA                PB9
++
++#define DEFAULT_I2C_BUS         BUS_I2C1
++
++#define USE_IMU_MPU6050
++#define IMU_MPU6050_ALIGN       CW0_DEG
++#define MPU6050_I2C_BUS         BUS_I2C1
++
++// #define USE_IMU_MPU9250
++// #define IMU_MPU9250_ALIGN       CW0_DEG
++// #define MPU9250_I2C_BUS         BUS_I2C1
++
++#define USE_BARO
++#define BARO_I2C_BUS            BUS_I2C1
++#define USE_BARO_BMP085
++#define USE_BARO_BMP280
++#define USE_BARO_MS5611
++
++#define USE_MAG
++#define AK8963_SPI_BUS          BUS_SPI2
++#define AK8963_CS_PIN           PB12
++#define MAG_I2C_BUS             BUS_I2C1
++#define USE_MAG_AK8963
++#define USE_MAG_AK8975
++#define USE_MAG_HMC5883
++#define USE_MAG_QMC5883
++#define USE_MAG_LIS3MDL
++#define USE_MAG_MPU9250
++
++#define MAG_HMC5883_ALIGN CW0_DEG
++
++// *************** ADC *****************************
++#define USE_ADC
++#define ADC_INSTANCE                ADC1
++#define ADC1_DMA_STREAM             DMA2_Stream0
++#define ADC_CHANNEL_1_PIN           PB0
++#define ADC_CHANNEL_2_PIN           PB1
++#define VBAT_ADC_CHANNEL            ADC_CHN_1
++#define CURRENT_METER_ADC_CHANNEL   ADC_CHN_2
++
++#define USE_LED_STRIP
++#define WS2811_PIN                  PA8
++
++// *************** PINIO ***************************
++#define USE_PINIO
++#define USE_PINIOBOX
++#define PINIO1_PIN                  PA13 // Camera switcher
++
++// ***************  OTHERS *************************
++#define DEFAULT_FEATURES        (FEATURE_TX_PROF_SEL | FEATURE_OSD | FEATURE_CURRENT_METER | FEATURE_VBAT | FEATURE_TELEMETRY | FEATURE_SOFTSERIAL )
++
++// #define USE_SPEKTRUM_BIND
++// #define BIND_PIN                PA3 //  RX1
++
++#define USE_DSHOT
++#define USE_ESC_SENSOR
++
++#define USE_SERIAL_4WAY_BLHELI_INTERFACE
++
++#define TARGET_IO_PORTA         0xffff
++#define TARGET_IO_PORTB         0xffff
++#define TARGET_IO_PORTC         0xffff
++#define TARGET_IO_PORTD         (BIT(2))
++
++#define MAX_PWM_OUTPUT_PORTS       9
+diff --git a/src/main/target/common_hardware.c b/src/main/target/common_hardware.c
+index 76ffbf194..f7fcf4252 100755
+--- a/src/main/target/common_hardware.c
++++ b/src/main/target/common_hardware.c
+@@ -33,6 +33,10 @@
+         BUSDEV_REGISTER_SPI(busdev_mpu6000,     DEVHW_MPU6000,      MPU6000_SPI_BUS,    MPU6000_CS_PIN,     NONE,  DEVFLAGS_NONE,  IMU_MPU6000_ALIGN);
+     #endif
+ 
++    #if defined(USE_IMU_MPU6050)
++        BUSDEV_REGISTER_I2C(busdev_mpu6050,     DEVHW_MPU6050,      MPU6050_I2C_BUS,    MPU_ADDRESS,        NONE,  DEVFLAGS_NONE,  IMU_MPU6050_ALIGN);
++    #endif
++	
+     #if defined(USE_IMU_MPU6500)
+         #if defined(MPU6500_SPI_BUS)
+         BUSDEV_REGISTER_SPI(busdev_mpu6500,     DEVHW_MPU6500,      MPU6500_SPI_BUS,    MPU6500_CS_PIN,     NONE,  DEVFLAGS_NONE,  IMU_MPU6500_ALIGN);
+diff --git a/src/main/target/sanity_check.h b/src/main/target/sanity_check.h
+index 5a1b7626e..983154a48 100644
+--- a/src/main/target/sanity_check.h
++++ b/src/main/target/sanity_check.h
+@@ -29,7 +29,7 @@
+ #error "Unnecessary USE_ACC and/or USE_GYRO"
+ #endif
+ 
+-#if defined (USE_GYRO_MPU6000) || defined (USE_ACC_MPU6000)
++#if defined (USE_GYRO_MPU6000) || defined (USE_ACC_MPU6000) || defined (USE_GYRO_MPU6050) || defined (USE_ACC_MPU6050)
+ #error "Replace USE_GYRO_xxx and USE_ACC_xxx with USE_IMU_xxx"
+ #endif
+ 
+@@ -49,6 +49,11 @@
+ #error "Replace USE_GYRO_xxx and USE_ACC_xxx with USE_IMU_xxx"
+ #endif
+ 
++// Make sure IMU alignments are migrated to IMU_xxx_ALIGN
++#if defined (GYRO_MPU6050_ALIGN) || defined (ACC_MPU6050_ALIGN)
++#error "Replace GYRO_MPU6050_ALIGN and ACC_MPU6050_ALIGN with IMU_MPU6050_ALIGN"
++#endif
++
+ #if defined (GYRO_MPU6000_ALIGN) || defined (ACC_MPU6000_ALIGN)
+ #error "Replace GYRO_MPU6000_ALIGN and ACC_MPU6000_ALIGN with IMU_MPU6000_ALIGN"
+ #endif
